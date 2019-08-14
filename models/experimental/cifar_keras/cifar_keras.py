@@ -22,6 +22,8 @@ from absl import app
 from absl import flags
 import absl.logging as _logging  # pylint: disable=unused-import
 import tensorflow as tf
+import numpy as np
+import os
 
 
 # Cloud TPU Cluster Resolvers
@@ -29,14 +31,6 @@ flags.DEFINE_string(
     'tpu', default=None,
     help='The Cloud TPU to use for training. This should be either the name '
     'used when creating the Cloud TPU, or a grpc://ip.address.of.tpu:8470 url.')
-flags.DEFINE_string(
-    "gcp_project", default=None,
-    help="Project name for the Cloud TPU-enabled project. If not specified, we "
-    "will attempt to automatically detect the GCE project from metadata.")
-flags.DEFINE_string(
-    "tpu_zone", default=None,
-    help="GCE zone where the Cloud TPU is located in. If not specified, we "
-    "will attempt to automatically detect the GCE project from metadata.")
 
 # Model specific paramenters
 flags.DEFINE_integer("batch_size", 128,
@@ -61,7 +55,7 @@ FLAGS = flags.FLAGS
 def model_fn(features, labels, mode, params):
   """Define a CIFAR model in Keras."""
   del params  # unused
-  layers = tf.contrib.keras.layers
+  layers = tf.keras.layers
 
   # Pass our input tensor to initialize the Keras input layer.
   v = layers.Input(tensor=features)
@@ -82,15 +76,15 @@ def model_fn(features, labels, mode, params):
   # complex models (e.g. regularization, batch-norm).  Once
   # `model_to_estimator` support is added for TPUs, it should be used instead.
   loss = tf.reduce_mean(
-      tf.nn.sparse_softmax_cross_entropy_with_logits(
+      tf.nn.softmax_cross_entropy_with_logits_v2(
           logits=logits, labels=labels
       )
   )
-  optimizer = tf.train.AdamOptimizer()
+  optimizer = tf.compat.v1.train.AdamOptimizer()
   if FLAGS.use_tpu:
     optimizer = tf.contrib.tpu.CrossShardOptimizer(optimizer)
 
-  train_op = optimizer.minimize(loss, global_step=tf.train.get_global_step())
+  train_op = optimizer.minimize(loss, global_step=tf.compat.v1.train.get_global_step())
 
   return tf.contrib.tpu.TPUEstimatorSpec(
       mode=mode,
@@ -104,29 +98,22 @@ def model_fn(features, labels, mode, params):
 
 
 def input_fn(params):
-  """Read CIFAR input data from a TFRecord dataset."""
+  """Read CIFAR input data from a TF Dataset API"""
   del params
   batch_size = FLAGS.batch_size
-  def parser(serialized_example):
-    """Parses a single tf.Example into image and label tensors."""
-    features = tf.parse_single_example(
-        serialized_example,
-        features={
-            "image": tf.FixedLenFeature([], tf.string),
-            "label": tf.FixedLenFeature([], tf.int64),
-        })
-    image = tf.decode_raw(features["image"], tf.uint8)
-    image.set_shape([3*32*32])
-    image = tf.cast(image, tf.float32) * (1. / 255) - 0.5
-    image = tf.transpose(tf.reshape(image, [3, 32, 32]))
-    label = tf.cast(features["label"], tf.int32)
-    return image, label
-
-  dataset = tf.data.TFRecordDataset([FLAGS.train_file])
-  dataset = dataset.map(parser, num_parallel_calls=batch_size)
-  dataset = dataset.prefetch(4 * batch_size).cache().repeat()
-  dataset = dataset.batch(FLAGS.batch_size, drop_remainder=True)
-  dataset = dataset.prefetch(1)
+  
+  (x_train, y_train), (x_test, y_test) = tf.keras.datasets.cifar10.load_data()
+  
+  x_train = (x_train / 255.0) - 0.5
+  x_train, y_train = x_train.astype(np.float32), y_train.astype(np.float32)
+  y_train = tf.keras.utils.to_categorical(y_train, 10)
+  
+  dataset = tf.data.Dataset.from_tensor_slices((x_train, y_train))\
+    .shuffle(2000)\
+    .prefetch(4 * batch_size).cache().repeat()\
+    .batch(batch_size, drop_remainder=True)\
+    .prefetch(1)
+				          
   return dataset
 
 
@@ -134,9 +121,7 @@ def main(argv):
   del argv  # Unused.
 
   tpu_cluster_resolver = tf.contrib.cluster_resolver.TPUClusterResolver(
-      FLAGS.tpu,
-      zone=FLAGS.tpu_zone,
-      project=FLAGS.gcp_project)
+      'grpc://' + os.environ['COLAB_TPU_ADDR'])
 
   run_config = tf.contrib.tpu.RunConfig(
       cluster=tpu_cluster_resolver,
