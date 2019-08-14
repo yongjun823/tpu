@@ -22,6 +22,7 @@ from absl import flags
 
 import numpy as np
 import tensorflow as tf
+import os
 
 
 # Define a dictionary that maps model names to their model classes inside Keras
@@ -42,18 +43,15 @@ MODELS = {
 
 flags.DEFINE_enum("model", None, MODELS.keys(), "Name of the model to be run",
                   case_sensitive=False)
-flags.DEFINE_string("tpu", None, "Name of the TPU to use")
-flags.DEFINE_integer("batch_size", 128, "Batch size to be used for model")
-flags.DEFINE_integer("epochs", 10, "Number of training epochs")
-flags.DEFINE_bool("use_synthetic_data", False,
-                  "Use synthetic data instead of Cifar; used for testing")
+flags.DEFINE_integer("batch_size", 256 * 8, "Batch size to be used for model")
+flags.DEFINE_integer("epochs", 100, "Number of training epochs")
+flags.DEFINE_string("mode", 'GPU', "train GPU OR TPU")
 
 FLAGS = flags.FLAGS
 
 
 class Cifar10Dataset(object):
   """CIFAR10 dataset, including train and test set.
-
   Each sample consists of a 32x32 color image, and label is from 10 classes.
   Note: Some models such as Xception require larger images than 32x32 so one
   needs to write a tf.data.dataset for Imagenet or use synthetic data.
@@ -61,7 +59,6 @@ class Cifar10Dataset(object):
 
   def __init__(self, batch_size):
     """Initializes train/test datasets.
-
     Args:
       batch_size: int, the number of batch size.
     """
@@ -72,50 +69,9 @@ class Cifar10Dataset(object):
     self.num_test_images = len(x_test)
 
     x_train, x_test = x_train / 255.0, x_test / 255.0
-    y_train, y_test = y_train.astype(np.int64), y_test.astype(np.int64)
-    y_train = tf.keras.utils.to_categorical(y_train, self.num_classes)
-    y_test = tf.keras.utils.to_categorical(y_test, self.num_classes)
-
-    self.train_dataset = (tf.data.Dataset.from_tensor_slices((x_train, y_train))
-                          .repeat()
-                          .shuffle(2000)
-                          .batch(batch_size, drop_remainder=True))
-    self.test_dataset = (tf.data.Dataset.from_tensor_slices((x_test, y_test))
-                         .shuffle(2000)
-                         .batch(batch_size, drop_remainder=True))
-
-
-class SyntheticDataset(object):
-  """Synthetic dataset, including train and test set.
-
-  Each sample consists of a 100x100 color image, and label is from 10 classes.
-  """
-
-  def __init__(self, batch_size):
-    """Initializes train/test datasets.
-
-    Args:
-      batch_size: int, the number of batch size.
-    """
-    image_size = 75
-    self.input_shape = (image_size, image_size, 3)
-    self.num_train_images = 2 * batch_size  # Run 2 steps
-    self.num_test_images = batch_size  # Run 1 step
-    self.num_classes = 10
-
-    x_train = np.random.randn(
-        self.num_train_images, image_size, image_size, 3).astype(np.float32)
-    y_train = np.random.randint(self.num_classes, size=self.num_train_images,
-                                dtype=np.int32)
-    y_train = y_train.reshape((self.num_train_images, 1))
-
-    x_test = np.random.randn(
-        self.num_test_images, image_size, image_size, 3).astype(np.float32)
-    y_test = np.random.randint(self.num_classes, size=self.num_test_images,
-                               dtype=np.int32)
-    y_test = y_test.reshape((self.num_test_images, 1))
-
-    y_train, y_test = y_train.astype(np.int64), y_test.astype(np.int64)
+    x_train, x_test = x_train.astype(np.float32), x_test.astype(np.float32)
+    y_train, y_test = y_train.astype(np.float32), y_test.astype(np.float32)
+    
     y_train = tf.keras.utils.to_categorical(y_train, self.num_classes)
     y_test = tf.keras.utils.to_categorical(y_test, self.num_classes)
 
@@ -130,21 +86,18 @@ class SyntheticDataset(object):
 
 def run():
   """Run the model training and return evaluation output."""
-  resolver = tf.contrib.cluster_resolver.TPUClusterResolver(tpu=FLAGS.tpu)
+  resolver = tf.contrib.cluster_resolver.TPUClusterResolver('grpc://' + os.environ['COLAB_TPU_ADDR'])
   tf.contrib.distribute.initialize_tpu_system(resolver)
   strategy = tf.contrib.distribute.TPUStrategy(resolver)
 
   model_cls = MODELS[FLAGS.model]
-  if FLAGS.use_synthetic_data:
-    data = SyntheticDataset(FLAGS.batch_size)
-  else:
-    data = Cifar10Dataset(FLAGS.batch_size)
+  data = Cifar10Dataset(FLAGS.batch_size)
 
   with strategy.scope():
     model = model_cls(weights=None, input_shape=data.input_shape,
                       classes=data.num_classes)
 
-    optimizer = tf.train.GradientDescentOptimizer(learning_rate=0.001)
+    optimizer = tf.keras.optimizers.Adam(learning_rate=1e-3)
     model.compile(loss="categorical_crossentropy",
                   optimizer=optimizer,
                   metrics=["accuracy"])
@@ -154,14 +107,42 @@ def run():
         epochs=FLAGS.epochs,
         steps_per_epoch=data.num_train_images // FLAGS.batch_size,
         validation_data=data.test_dataset,
-        validation_steps=data.num_test_images // FLAGS.batch_size)
+        validation_steps=data.num_test_images // FLAGS.batch_size,
+        validation_freq=50)
 
     return history.history
 
+def run_gpu():
+  model_cls = MODELS[FLAGS.model]
+  data = Cifar10Dataset(FLAGS.batch_size)
+
+  model = model_cls(weights=None, input_shape=data.input_shape,
+                    classes=data.num_classes)
+
+  optimizer = tf.keras.optimizers.Adam(learning_rate=1e-3)
+  model.compile(loss="categorical_crossentropy",
+                optimizer=optimizer,
+                metrics=["accuracy"])
+
+  history = model.fit(
+      data.train_dataset,
+      epochs=FLAGS.epochs,
+      steps_per_epoch=data.num_train_images // FLAGS.batch_size,
+      validation_data=data.test_dataset,
+      validation_steps=data.num_test_images // FLAGS.batch_size,
+      validation_freq=50)
+
+  return history.history
 
 def main(argv):
   del argv
-  run()
+  
+  if FLAGS.mode == 'GPU':
+    run_gpu()
+  elif FLAGS.mode == 'TPU':
+    run():
+  else:
+    print('mode error!')
 
 
 if __name__ == "__main__":
