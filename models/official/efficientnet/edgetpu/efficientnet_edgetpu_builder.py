@@ -23,6 +23,7 @@ import tensorflow as tf
 
 import efficientnet_builder
 import efficientnet_model
+import utils
 
 # The input tensor is in the range of [0, 255], we need to scale them to the
 # range of [0, 1]
@@ -65,7 +66,11 @@ def efficientnet_edgetpu(width_coefficient=None,
       depth_coefficient=depth_coefficient,
       depth_divisor=8,
       min_depth=None,
-      relu_fn=tf.nn.relu)
+      relu_fn=tf.nn.relu,
+      # The default is TPU-specific batch norm.
+      # The alternative is tf.layers.BatchNormalization.
+      batch_norm=utils.TpuBatchNormalization,  # TPU-specific requirement.
+      use_se=False)
   decoder = efficientnet_builder.BlockDecoder()
   return decoder.decode(blocks_args), global_params
 
@@ -95,7 +100,8 @@ def build_model(images,
                 model_name,
                 training,
                 override_params=None,
-                model_dir=None):
+                model_dir=None,
+                fine_tuning=False):
   """A helper functiion to creates a model and returns predicted logits.
 
   Args:
@@ -105,6 +111,7 @@ def build_model(images,
     override_params: A dictionary of params for overriding. Fields must exist in
       efficientnet_model.GlobalParams.
     model_dir: string, optional model dir for saving configs.
+    fine_tuning: boolean, whether the model is used for finetuning.
 
   Returns:
     logits: the logits tensor of classes.
@@ -115,7 +122,13 @@ def build_model(images,
     When override_params has invalid fields, raises ValueError.
   """
   assert isinstance(images, tf.Tensor)
+  if not training or fine_tuning:
+    if not override_params:
+      override_params = {}
+    override_params['batch_norm'] = utils.BatchNormalization
   blocks_args, global_params = get_model_params(model_name, override_params)
+  if not training or fine_tuning:
+    global_params = global_params._replace(batch_norm=utils.BatchNormalization)
 
   if model_dir:
     param_file = os.path.join(model_dir, 'model_params.txt')

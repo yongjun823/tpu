@@ -110,7 +110,6 @@ def main(unused_argv):
   job_name = 'worker'
   primary_cpu_task = '/job:%s' % job_name
 
-  is_tpu_pod = num_workers > 1
   model_dir = FLAGS.model_dir if FLAGS.model_dir else DEFAULT_MODEL_DIR
   batch_size = PER_CORE_BATCH_SIZE * FLAGS.num_cores
   steps_per_epoch = FLAGS.steps_per_epoch or (int(
@@ -127,43 +126,20 @@ def main(unused_argv):
   strategy = tf.distribute.experimental.TPUStrategy(resolver)
 
   with tf.device(primary_cpu_task):
-    # TODO(b/130307853): In TPU Pod, we have to use
-    # `strategy.experimental_distribute_datasets_from_function` instead of
-    # `strategy.experimental_distribute_dataset` because dataset cannot be
-    # cloned in eager mode. And when using
-    # `strategy.experimental_distribute_datasets_from_function`, we should use
-    # per core batch size instead of global batch size, because no re-batch is
-    # happening in this case.
-    if is_tpu_pod:
-      imagenet_train = imagenet_input.ImageNetInput(
-          is_training=True,
-          data_dir=FLAGS.data,
-          batch_size=PER_CORE_BATCH_SIZE,
-          use_bfloat16=_USE_BFLOAT16)
-      imagenet_eval = imagenet_input.ImageNetInput(
-          is_training=False,
-          data_dir=FLAGS.data,
-          batch_size=PER_CORE_BATCH_SIZE,
-          use_bfloat16=_USE_BFLOAT16)
-      train_dataset = strategy.experimental_distribute_datasets_from_function(
-          imagenet_train.input_fn)
-      test_dataset = strategy.experimental_distribute_datasets_from_function(
-          imagenet_eval.input_fn)
-    else:
-      imagenet_train = imagenet_input.ImageNetInput(
-          is_training=True,
-          data_dir=FLAGS.data,
-          batch_size=batch_size,
-          use_bfloat16=_USE_BFLOAT16)
-      imagenet_eval = imagenet_input.ImageNetInput(
-          is_training=False,
-          data_dir=FLAGS.data,
-          batch_size=batch_size,
-          use_bfloat16=_USE_BFLOAT16)
-      train_dataset = strategy.experimental_distribute_dataset(
-          imagenet_train.input_fn())
-      test_dataset = strategy.experimental_distribute_dataset(
-          imagenet_eval.input_fn())
+    imagenet_train = imagenet_input.ImageNetInput(
+        is_training=True,
+        data_dir=FLAGS.data,
+        batch_size=batch_size,
+        use_bfloat16=_USE_BFLOAT16)
+    imagenet_eval = imagenet_input.ImageNetInput(
+        is_training=False,
+        data_dir=FLAGS.data,
+        batch_size=batch_size,
+        use_bfloat16=_USE_BFLOAT16)
+    train_dataset = strategy.experimental_distribute_dataset(
+        imagenet_train.input_fn())
+    test_dataset = strategy.experimental_distribute_dataset(
+        imagenet_eval.input_fn())
 
     with strategy.scope():
       logging.info('Building Keras ResNet-50 model')
@@ -181,13 +157,15 @@ def main(unused_argv):
           'test_accuracy', dtype=tf.float32)
       logging.info('Finished building Keras ResNet-50 model')
 
-    checkpoint = tf.train.Checkpoint(model=model, optimizer=optimizer)
-    latest_checkpoint = tf.train.latest_checkpoint(model_dir)
-    initial_epoch = 0
-    if latest_checkpoint:
-      checkpoint.restore(latest_checkpoint)
-      logging.info('Loaded checkpoint %s', latest_checkpoint)
-      initial_epoch = optimizer.iterations.numpy() // steps_per_epoch
+      checkpoint = tf.train.Checkpoint(model=model, optimizer=optimizer)
+      latest_checkpoint = tf.train.latest_checkpoint(model_dir)
+      initial_epoch = 0
+      if latest_checkpoint:
+        # checkpoint.restore must be within a strategy.scope() so that optimizer
+        # slot variables are mirrored.
+        checkpoint.restore(latest_checkpoint)
+        logging.info('Loaded checkpoint %s', latest_checkpoint)
+        initial_epoch = optimizer.iterations.numpy() // steps_per_epoch
 
     # Create summary writers
     train_summary_writer = tf.summary.create_file_writer(
@@ -215,9 +193,9 @@ def main(unused_argv):
 
           # Scale the loss given the TPUStrategy will reduce sum all gradients.
           loss = loss1 + loss2
-          loss = loss / strategy.num_replicas_in_sync
+          scaled_loss = loss / strategy.num_replicas_in_sync
 
-        grads = tape.gradient(loss, model.trainable_variables)
+        grads = tape.gradient(scaled_loss, model.trainable_variables)
         optimizer.apply_gradients(zip(grads, model.trainable_variables))
         training_loss.update_state(loss)
         training_accuracy.update_state(labels, predictions)
@@ -232,7 +210,7 @@ def main(unused_argv):
         predictions = model(images, training=False)
         loss = tf.keras.losses.sparse_categorical_crossentropy(labels,
                                                                predictions)
-        loss = safe_mean(loss) / strategy.num_replicas_in_sync
+        loss = safe_mean(loss)
         test_loss.update_state(loss)
         test_accuracy.update_state(labels, predictions)
 

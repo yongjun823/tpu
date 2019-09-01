@@ -18,11 +18,13 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import functools
 import os
 import re
 import tensorflow as tf
 
 import efficientnet_model
+import utils
 
 MEAN_RGB = [0.485 * 255, 0.456 * 255, 0.406 * 255]
 STDDEV_RGB = [0.229 * 255, 0.224 * 255, 0.225 * 255]
@@ -118,6 +120,32 @@ class BlockDecoder(object):
     return block_strings
 
 
+def swish(features, use_native=True):
+  """Computes the Swish activation function.
+
+  The tf.nn.swish operation uses a custom gradient to reduce memory usage.
+  Since saving custom gradients in SavedModel is currently not supported, and
+  one would not be able to use an exported TF-Hub module for fine-tuning, we
+  provide this wrapper that can allow to select whether to use the native
+  TensorFlow swish operation, or whether to use a customized operation that
+  has uses default TensorFlow gradient computation.
+
+  Args:
+    features: A `Tensor` representing preactivation values.
+    use_native: Whether to use the native swish from tf.nn that uses a custom
+      gradient to reduce memory usage, or to use customized swish that uses
+      default TensorFlow gradient computation.
+
+  Returns:
+    The activation value.
+  """
+  if use_native:
+    return tf.nn.swish(features)
+  else:
+    features = tf.convert_to_tensor(features, name='features')
+    return features * tf.nn.sigmoid(features)
+
+
 def efficientnet(width_coefficient=None,
                  depth_coefficient=None,
                  dropout_rate=0.2,
@@ -140,7 +168,11 @@ def efficientnet(width_coefficient=None,
       depth_coefficient=depth_coefficient,
       depth_divisor=8,
       min_depth=None,
-      relu_fn=tf.nn.swish)
+      relu_fn=tf.nn.swish,
+      # The default is TPU-specific batch norm.
+      # The alternative is tf.layers.BatchNormalization.
+      batch_norm=utils.TpuBatchNormalization,  # TPU-specific requirement.
+      use_se=True)
   decoder = BlockDecoder()
   return decoder.decode(blocks_args), global_params
 
@@ -169,7 +201,9 @@ def build_model(images,
                 model_name,
                 training,
                 override_params=None,
-                model_dir=None):
+                model_dir=None,
+                fine_tuning=False,
+                features_only=False):
   """A helper functiion to creates a model and returns predicted logits.
 
   Args:
@@ -179,6 +213,8 @@ def build_model(images,
     override_params: A dictionary of params for overriding. Fields must exist in
       efficientnet_model.GlobalParams.
     model_dir: string, optional model dir for saving configs.
+    fine_tuning: boolean, whether the model is used for finetuning.
+    features_only: build the base feature network only.
 
   Returns:
     logits: the logits tensor of classes.
@@ -189,6 +225,11 @@ def build_model(images,
     When override_params has invalid fields, raises ValueError.
   """
   assert isinstance(images, tf.Tensor)
+  if not training or fine_tuning:
+    if not override_params:
+      override_params = {}
+    override_params['batch_norm'] = utils.BatchNormalization
+    override_params['relu_fn'] = functools.partial(swish, use_native=False)
   blocks_args, global_params = get_model_params(model_name, override_params)
 
   if model_dir:
@@ -204,10 +245,9 @@ def build_model(images,
 
   with tf.variable_scope(model_name):
     model = efficientnet_model.Model(blocks_args, global_params)
-    logits = model(images, training=training)
-
-  logits = tf.identity(logits, 'logits')
-  return logits, model.endpoints
+    outputs = model(images, training=training, features_only=features_only)
+  outputs = tf.identity(outputs, 'features' if features_only else 'logits')
+  return outputs, model.endpoints
 
 
 def build_model_base(images, model_name, training, override_params=None):
@@ -215,10 +255,10 @@ def build_model_base(images, model_name, training, override_params=None):
 
   Args:
     images: input images tensor.
-    model_name: string, the model name of a pre-defined MnasNet.
+    model_name: string, the predefined model name.
     training: boolean, whether the model is constructed for training.
     override_params: A dictionary of params for overriding. Fields must exist in
-      mnasnet_model.GlobalParams.
+      efficientnet_model.GlobalParams.
 
   Returns:
     features: global pool features.
