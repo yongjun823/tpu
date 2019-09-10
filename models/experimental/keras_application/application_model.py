@@ -140,7 +140,7 @@ def main(argv):
   if FLAGS.mode == 'GPU':
     run_gpu()
   elif FLAGS.mode == 'TPU':
-    run():
+    run()
   else:
     print('mode error!')
 
